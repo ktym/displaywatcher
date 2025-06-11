@@ -63,7 +63,7 @@ You can modify the displayplacer command anytime to adjust your desired resoluti
 
 ## Author
 
-* Toshiaki Katayama
+* Toshiaki Katayama ([@ktym](https://github.com/ktym/))
 * ChatGPT
 
 ## License
