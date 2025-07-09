@@ -8,10 +8,22 @@ class DisplayObserver {
     private var addedIter: io_iterator_t = 0
     private var removedIter: io_iterator_t = 0
     private var cgNotificationCallback: CGDisplayReconfigurationCallBack?
-    private var debounceTimer: Timer?
+    private var quickTimer: Timer?
     private var lastDisplayCount: Int = 0
+    private var displayStates: [CGDirectDisplayID: DisplayState] = [:]
+    private var isProcessingChange = false
+
+    struct DisplayState {
+        let displayID: CGDirectDisplayID
+        let width: Int
+        let height: Int
+        let refreshRate: Double
+        let pixelWidth: Int
+        let pixelHeight: Int
+    }
 
     init() {
+        captureInitialDisplayStates()
         startMonitoring()
         startCGMonitoring()
     }
@@ -19,6 +31,41 @@ class DisplayObserver {
     deinit {
         stopMonitoring()
         stopCGMonitoring()
+    }
+
+    private func captureInitialDisplayStates() {
+        var displayCount: UInt32 = 0
+        CGGetActiveDisplayList(0, nil, &displayCount)
+
+        if displayCount > 0 {
+            let displays = UnsafeMutablePointer<CGDirectDisplayID>.allocate(capacity: Int(displayCount))
+            defer { displays.deallocate() }
+
+            CGGetActiveDisplayList(displayCount, displays, &displayCount)
+
+            for i in 0..<Int(displayCount) {
+                let displayID = displays[i]
+                if let state = getCurrentDisplayState(displayID) {
+                    displayStates[displayID] = state
+                    print("Record initial state: Display \(displayID) - \(state.width)x\(state.height)")
+                }
+            }
+        }
+        lastDisplayCount = Int(displayCount)
+    }
+
+    private func getCurrentDisplayState(_ displayID: CGDirectDisplayID) -> DisplayState? {
+        let mode = CGDisplayCopyDisplayMode(displayID)
+        guard let currentMode = mode else { return nil }
+
+        return DisplayState(
+            displayID: displayID,
+            width: currentMode.width,
+            height: currentMode.height,
+            refreshRate: currentMode.refreshRate,
+            pixelWidth: currentMode.pixelWidth,
+            pixelHeight: currentMode.pixelHeight
+        )
     }
 
     private func startMonitoring() {
@@ -32,7 +79,7 @@ class DisplayObserver {
             kIOMatchedNotification,
             matchingDict,
             displayConnectedCallback,
-            nil,
+            Unmanaged.passUnretained(self).toOpaque(),
             &addedIter
         )
 
@@ -41,7 +88,7 @@ class DisplayObserver {
             kIOTerminatedNotification,
             matchingDict,
             displayDisconnectedCallback,
-            nil,
+            Unmanaged.passUnretained(self).toOpaque(),
             &removedIter
         )
 
@@ -52,15 +99,115 @@ class DisplayObserver {
 
     private func startCGMonitoring() {
         cgNotificationCallback = { (display, flags, userInfo) in
-            if flags.contains(.setModeFlag) || flags.contains(.addFlag) || flags.contains(.removeFlag) {
-                let observer = Unmanaged<DisplayObserver>.fromOpaque(userInfo!).takeUnretainedValue()
-                observer.handleDisplayChange()
-            }
+            let observer = Unmanaged<DisplayObserver>.fromOpaque(userInfo!).takeUnretainedValue()
+            observer.handleCGDisplayChange(display: display, flags: flags)
         }
 
         let observer = Unmanaged.passUnretained(self).toOpaque()
         CGDisplayRegisterReconfigurationCallback(cgNotificationCallback!, observer)
-        lastDisplayCount = getCurrentDisplayCount()
+    }
+
+    private func handleCGDisplayChange(display: CGDirectDisplayID, flags: CGDisplayChangeSummaryFlags) {
+        guard !isProcessingChange else { return }
+
+        if flags.contains(.setModeFlag) {
+            print("Resolution change detected: Display \(display)")
+            // Immediate response
+            quickTimer?.invalidate()
+            quickTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: false) { _ in
+                self.immediateRestore(for: display)
+            }
+        } else if flags.contains(.addFlag) {
+            print("New display added: \(display)")
+            handleDisplayAddition()
+        } else if flags.contains(.removeFlag) {
+            print("Display removed: \(display)")
+            displayStates.removeValue(forKey: display)
+        }
+    }
+
+    private func handleDisplayAddition() {
+        isProcessingChange = true
+
+        // Wait briefly, then attempt multiple restoration attempts
+        let delays = [0.1, 0.3, 0.5, 1.0, 2.0]
+
+        for (index, delay) in delays.enumerated() {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                print("Restoration attempt \(index + 1)/\(delays.count)")
+                self.restoreAllDisplayStates()
+
+                if index == delays.count - 1 {
+                    self.isProcessingChange = false
+                }
+            }
+        }
+    }
+
+    private func immediateRestore(for displayID: CGDirectDisplayID) {
+        guard let savedState = displayStates[displayID] else { return }
+
+        print("Attempting immediate restoration: Display \(displayID)")
+
+        // Get current state
+        guard let currentState = getCurrentDisplayState(displayID) else { return }
+
+        // Only restore if resolution has changed
+        if currentState.width != savedState.width || currentState.height != savedState.height {
+            print("Resolution change detected: \(currentState.width)x\(currentState.height) -> \(savedState.width)x\(savedState.height)")
+            restoreDisplayState(displayID, to: savedState)
+        }
+    }
+
+    private func restoreAllDisplayStates() {
+        for (displayID, savedState) in displayStates {
+            guard let currentState = getCurrentDisplayState(displayID) else { continue }
+
+            if currentState.width != savedState.width || currentState.height != savedState.height {
+                print("Restore: Display \(displayID) \(currentState.width)x\(currentState.height) -> \(savedState.width)x\(savedState.height)")
+                restoreDisplayState(displayID, to: savedState)
+            }
+        }
+    }
+
+    private func restoreDisplayState(_ displayID: CGDirectDisplayID, to targetState: DisplayState) {
+        // Get available modes
+        guard let modes = CGDisplayCopyAllDisplayModes(displayID, nil) else { return }
+
+        let modeCount = CFArrayGetCount(modes)
+        var bestMode: CGDisplayMode?
+
+        for i in 0..<modeCount {
+            let mode = unsafeBitCast(CFArrayGetValueAtIndex(modes, i), to: CGDisplayMode.self)
+
+            if mode.width == targetState.width && 
+               mode.height == targetState.height &&
+               mode.pixelWidth == targetState.pixelWidth &&
+               mode.pixelHeight == targetState.pixelHeight {
+                bestMode = mode
+                break
+            }
+        }
+
+        guard let targetMode = bestMode else {
+            print("Target resolution mode not found")
+            return
+        }
+
+        // Set resolution
+        let config = CGDisplaySetDisplayMode(displayID, targetMode, nil)
+        if config == .success {
+            print("Resolution restored: \(targetState.width)x\(targetState.height)")
+        } else {
+            print("Resolution restoration failed: \(config)")
+            // Fallback: use displayplacer
+            fallbackToDisplayplacer()
+        }
+    }
+
+    private func fallbackToDisplayplacer() {
+        print("Fallback to displayplacer")
+        DisplayObserver.applyDisplayplacer()
     }
 
     private func stopMonitoring() {
@@ -70,50 +217,15 @@ class DisplayObserver {
     }
 
     private func stopCGMonitoring() {
-        if let callback = cgNotificationCallback {
-            CGDisplayUnregisterReconfigurationCallback(callback, Unmanaged.passUnretained(self).toOpaque())
-        }
+        // Note: CoreGraphics doesn't provide unregister function
+        // The callback will be automatically cleaned up when the process ends
+        cgNotificationCallback = nil
     }
 
     private func getCurrentDisplayCount() -> Int {
         var displayCount: UInt32 = 0
         CGGetActiveDisplayList(0, nil, &displayCount)
         return Int(displayCount)
-    }
-
-    private func handleDisplayChange() {
-        let currentDisplayCount = getCurrentDisplayCount()
-        // Cancel previous timer
-        debounceTimer?.invalidate()
-        // Only apply settings if display count changed
-        if currentDisplayCount != lastDisplayCount {
-            print("Display count changed from \(lastDisplayCount) to \(currentDisplayCount)")
-            lastDisplayCount = currentDisplayCount
-            // Use longer delay and retry mechanism
-            debounceTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { _ in
-                self.applyDisplayplacerWithRetry()
-            }
-        }
-    }
-
-    private func applyDisplayplacerWithRetry() {
-        let maxRetries = 3
-        var attempt = 0
-        func attemptApply() {
-            attempt += 1
-            print("Applying displayplacer (attempt \(attempt)/\(maxRetries))")
-            if DisplayObserver.applyDisplayplacer() {
-                print("Successfully applied displayplacer")
-            } else if attempt < maxRetries {
-                // Retry after 1 second
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                    attemptApply()
-                }
-            } else {
-                print("Failed to apply displayplacer after \(maxRetries) attempts")
-            }
-        }
-        attemptApply()
     }
 
     static func consumeIterator(_ iterator: io_iterator_t) {
@@ -182,6 +294,11 @@ class DisplayObserver {
 func displayConnectedCallback(refcon: UnsafeMutableRawPointer?, iterator: io_iterator_t) {
     DisplayObserver.consumeIterator(iterator)
     DisplayObserver.deviceConnected()
+
+    if let refcon = refcon {
+        let _ = Unmanaged<DisplayObserver>.fromOpaque(refcon).takeUnretainedValue()
+        // Additional connection handling can be added here
+    }
 }
 
 func displayDisconnectedCallback(refcon: UnsafeMutableRawPointer?, iterator: io_iterator_t) {
