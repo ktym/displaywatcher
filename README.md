@@ -4,6 +4,10 @@ DisplayWatcher automatically monitors display connection changes on macOS and ap
 
 <img src="DisplayWatcher.png" alt="DisplayWatcher Icon" width="200"/>
 
+## Note
+
+This software is still under development and has not been thoroughly tested, so it may not function properly.
+
 ## Motivation
 
 Every time I connect a new external display, macOS automatically changes the resolution of the built-in display, which is quite annoying. I wanted to detect display connection events and automatically restore the built-in display to my preferred resolution.
