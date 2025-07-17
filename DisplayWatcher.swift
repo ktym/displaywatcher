@@ -9,9 +9,9 @@ class DisplayObserver {
     private var removedIter: io_iterator_t = 0
     private var cgNotificationCallback: CGDisplayReconfigurationCallBack?
     private var quickTimer: Timer?
-    private var lastDisplayCount: Int = 0
-    private var displayStates: [CGDirectDisplayID: DisplayState] = [:]
     private var isProcessingChange = false
+    private var preferredBuiltinResolution: (width: Int, height: Int)? = nil
+    private var restorationCompleted = false
 
     struct DisplayState {
         let displayID: CGDirectDisplayID
@@ -23,7 +23,7 @@ class DisplayObserver {
     }
 
     init() {
-        captureInitialDisplayStates()
+        loadPreferredBuiltinResolution()
         startMonitoring()
         startCGMonitoring()
     }
@@ -31,41 +31,6 @@ class DisplayObserver {
     deinit {
         stopMonitoring()
         stopCGMonitoring()
-    }
-
-    private func captureInitialDisplayStates() {
-        var displayCount: UInt32 = 0
-        CGGetActiveDisplayList(0, nil, &displayCount)
-
-        if displayCount > 0 {
-            let displays = UnsafeMutablePointer<CGDirectDisplayID>.allocate(capacity: Int(displayCount))
-            defer { displays.deallocate() }
-
-            CGGetActiveDisplayList(displayCount, displays, &displayCount)
-
-            for i in 0..<Int(displayCount) {
-                let displayID = displays[i]
-                if let state = getCurrentDisplayState(displayID) {
-                    displayStates[displayID] = state
-                    print("Record initial state: Display \(displayID) - \(state.width)x\(state.height)")
-                }
-            }
-        }
-        lastDisplayCount = Int(displayCount)
-    }
-
-    private func getCurrentDisplayState(_ displayID: CGDirectDisplayID) -> DisplayState? {
-        let mode = CGDisplayCopyDisplayMode(displayID)
-        guard let currentMode = mode else { return nil }
-
-        return DisplayState(
-            displayID: displayID,
-            width: currentMode.width,
-            height: currentMode.height,
-            refreshRate: currentMode.refreshRate,
-            pixelWidth: currentMode.pixelWidth,
-            pixelHeight: currentMode.pixelHeight
-        )
     }
 
     private func startMonitoring() {
@@ -109,20 +74,75 @@ class DisplayObserver {
 
     private func handleCGDisplayChange(display: CGDirectDisplayID, flags: CGDisplayChangeSummaryFlags) {
         guard !isProcessingChange else { return }
-
-        if flags.contains(.setModeFlag) {
-            print("Resolution change detected: Display \(display)")
-            // Immediate response
-            quickTimer?.invalidate()
-            quickTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: false) { _ in
-                self.immediateRestore(for: display)
+        isProcessingChange = true
+        restorationCompleted = false
+        print("Display change detected. Scheduling aggressive restoration of built-in display resolution.")
+        let maxAttempts = 90
+        let interval: TimeInterval = 2.0
+        for attempt in 0..<maxAttempts {
+            DispatchQueue.main.asyncAfter(deadline: .now() + interval * Double(attempt)) {
+                if self.restorationCompleted {
+                    if attempt == maxAttempts - 1 {
+                        self.isProcessingChange = false
+                    }
+                    return
+                }
+                print("[Aggressive] Built-in display restoration attempt \(attempt + 1)/\(maxAttempts)")
+                let restored = self.restoreBuiltinDisplayResolution()
+                if restored {
+                    self.restorationCompleted = true
+                    self.isProcessingChange = false
+                    print("Restoration successful. No further attempts needed.")
+                } else if attempt == maxAttempts - 1 {
+                    self.isProcessingChange = false
+                    print("Restoration attempts finished. Resolution may not have been restored.")
+                }
             }
-        } else if flags.contains(.addFlag) {
-            print("New display added: \(display)")
-            handleDisplayAddition()
-        } else if flags.contains(.removeFlag) {
-            print("Display removed: \(display)")
-            displayStates.removeValue(forKey: display)
+        }
+    }
+
+    private func restoreBuiltinDisplayResolution() -> Bool {
+        guard let preferred = preferredBuiltinResolution else {
+            print("No preferred built-in display resolution set.")
+            return false
+        }
+        guard let builtinID = getBuiltinDisplayID() else {
+            print("No built-in display found.")
+            return false
+        }
+        guard let currentMode = CGDisplayCopyDisplayMode(builtinID) else {
+            print("Could not get current mode for built-in display.")
+            return false
+        }
+        if currentMode.width == preferred.width && currentMode.height == preferred.height {
+            print("Built-in display already at preferred resolution: \(preferred.width)x\(preferred.height)")
+            return true
+        }
+        print("Restoring built-in display to preferred resolution: \(preferred.width)x\(preferred.height)")
+        guard let modes = CGDisplayCopyAllDisplayModes(builtinID, nil) else {
+            print("Could not get available modes for built-in display.")
+            return false
+        }
+        let modeCount = CFArrayGetCount(modes)
+        var bestMode: CGDisplayMode?
+        for i in 0..<modeCount {
+            let mode = unsafeBitCast(CFArrayGetValueAtIndex(modes, i), to: CGDisplayMode.self)
+            if mode.width == preferred.width && mode.height == preferred.height {
+                bestMode = mode
+                break
+            }
+        }
+        guard let targetMode = bestMode else {
+            print("Preferred resolution mode not found for built-in display.")
+            return false
+        }
+        let config = CGDisplaySetDisplayMode(builtinID, targetMode, nil)
+        if config == .success {
+            print("Built-in display resolution restored: \(preferred.width)x\(preferred.height)")
+            return true
+        } else {
+            print("Failed to restore built-in display resolution: \(config)")
+            return false
         }
     }
 
@@ -135,7 +155,7 @@ class DisplayObserver {
         for (index, delay) in delays.enumerated() {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 print("Restoration attempt \(index + 1)/\(delays.count)")
-                self.restoreAllDisplayStates()
+                // self.restoreAllDisplayStates() // Removed
 
                 if index == delays.count - 1 {
                     self.isProcessingChange = false
@@ -144,71 +164,9 @@ class DisplayObserver {
         }
     }
 
-    private func immediateRestore(for displayID: CGDirectDisplayID) {
-        guard let savedState = displayStates[displayID] else { return }
+    // Removed: restoreAllDisplayStates
 
-        print("Attempting immediate restoration: Display \(displayID)")
-
-        // Get current state
-        guard let currentState = getCurrentDisplayState(displayID) else { return }
-
-        // Only restore if resolution has changed
-        if currentState.width != savedState.width || currentState.height != savedState.height {
-            print("Resolution change detected: \(currentState.width)x\(currentState.height) -> \(savedState.width)x\(savedState.height)")
-            restoreDisplayState(displayID, to: savedState)
-        }
-    }
-
-    private func restoreAllDisplayStates() {
-        for (displayID, savedState) in displayStates {
-            guard let currentState = getCurrentDisplayState(displayID) else { continue }
-
-            if currentState.width != savedState.width || currentState.height != savedState.height {
-                print("Restore: Display \(displayID) \(currentState.width)x\(currentState.height) -> \(savedState.width)x\(savedState.height)")
-                restoreDisplayState(displayID, to: savedState)
-            }
-        }
-    }
-
-    private func restoreDisplayState(_ displayID: CGDirectDisplayID, to targetState: DisplayState) {
-        // Get available modes
-        guard let modes = CGDisplayCopyAllDisplayModes(displayID, nil) else { return }
-
-        let modeCount = CFArrayGetCount(modes)
-        var bestMode: CGDisplayMode?
-
-        for i in 0..<modeCount {
-            let mode = unsafeBitCast(CFArrayGetValueAtIndex(modes, i), to: CGDisplayMode.self)
-
-            if mode.width == targetState.width && 
-               mode.height == targetState.height &&
-               mode.pixelWidth == targetState.pixelWidth &&
-               mode.pixelHeight == targetState.pixelHeight {
-                bestMode = mode
-                break
-            }
-        }
-
-        guard let targetMode = bestMode else {
-            print("Target resolution mode not found")
-            return
-        }
-
-        // Set resolution
-        let config = CGDisplaySetDisplayMode(displayID, targetMode, nil)
-        if config == .success {
-            print("Resolution restored: \(targetState.width)x\(targetState.height)")
-        } else {
-            print("Resolution restoration failed: \(config)")
-            // Fallback: use displayplacer
-            fallbackToDisplayplacer()
-        }
-    }
-
-    private func fallbackToDisplayplacer() {
-        print("Fallback to displayplacer")
-        DisplayObserver.applyDisplayplacer()
-    }
+    // Remove any code that references displayStates, lastDisplayCount, or the removed methods
 
     private func stopMonitoring() {
         if let port = notifyPort {
@@ -285,6 +243,52 @@ class DisplayObserver {
             }
         } else {
             print("Configuration file not found: \(configPath.path)")
+        }
+        return nil
+    }
+
+    private func loadPreferredBuiltinResolution() {
+        // Read preferred resolution from config file
+        let fileManager = FileManager.default
+        let appSupportDir = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/DisplayWatcher")
+        let configPath = appSupportDir.appendingPathComponent("displaywatcher.conf")
+        if fileManager.fileExists(atPath: configPath.path) {
+            do {
+                let contents = try String(contentsOf: configPath, encoding: .utf8)
+                let lines = contents.components(separatedBy: .newlines)
+                for line in lines {
+                    let trimmed = line.trimmingCharacters(in: .whitespaces)
+                    if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
+                    let parts = trimmed.split(separator: "x")
+                    if parts.count == 2, let w = Int(parts[0]), let h = Int(parts[1]) {
+                        preferredBuiltinResolution = (width: w, height: h)
+                        print("Preferred built-in display resolution loaded: \(w)x\(h)")
+                        return
+                    }
+                }
+                print("No valid resolution found in displaywatcher.conf")
+            } catch {
+                print("Failed to read displaywatcher.conf: \(error)")
+            }
+        } else {
+            print("displaywatcher.conf not found: \(configPath.path)")
+        }
+    }
+
+    private func getBuiltinDisplayID() -> CGDirectDisplayID? {
+        var displayCount: UInt32 = 0
+        CGGetActiveDisplayList(0, nil, &displayCount)
+        if displayCount > 0 {
+            let displays = UnsafeMutablePointer<CGDirectDisplayID>.allocate(capacity: Int(displayCount))
+            defer { displays.deallocate() }
+            CGGetActiveDisplayList(displayCount, displays, &displayCount)
+            for i in 0..<Int(displayCount) {
+                let displayID = displays[i]
+                if CGDisplayIsBuiltin(displayID) != 0 {
+                    return displayID
+                }
+            }
         }
         return nil
     }

@@ -5,20 +5,6 @@ set -e
 # Simple logger
 log() { echo "[DisplayWatcher Installer] $1"; }
 
-# Check for Homebrew
-if ! command -v brew &>/dev/null; then
-    echo "[Error] Homebrew is not installed. Please install Homebrew first: https://brew.sh/"
-    exit 1
-fi
-
-# Install displayplacer if not installed
-if ! command -v displayplacer &>/dev/null; then
-    log "Installing displayplacer via Homebrew..."
-    brew install displayplacer
-else
-    log "displayplacer already installed."
-fi
-
 # Install app bundle to /Applications
 log "Installing app bundle..."
 if [ ! -d "DisplayWatcher.app" ]; then
@@ -38,20 +24,15 @@ mkdir -p "$CONFIG_DIR"
 CONFIG_FILE="$CONFIG_DIR/displaywatcher.conf"
 if [ ! -f "$CONFIG_FILE" ]; then
   log "Writing config template..."
-
-  DETECTED_COMMAND=$(displayplacer list | grep '^displayplacer "id:' | head -n 1)
-  
   cat > "$CONFIG_FILE" <<CONF
 # DisplayWatcher Configuration
-# Automatically detected current displayplacer configuration:
+# Specify your preferred built-in display resolution below in the format WIDTHxHEIGHT (e.g., 2560x1600)
+# Only the first valid line will be used. Lines starting with # or blank lines are ignored.
 
-$DETECTED_COMMAND
+2560x1600
 
-# You may modify this if needed.
-# Tip:
-# - Set your desired display arrangement manually first.
-# - Then run: displayplacer list | grep '^displayplacer "id:'
-# - Copy the output here to update this configuration.
+# Example:
+# 1920x1200
 CONF
 fi
 
